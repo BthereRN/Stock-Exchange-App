@@ -649,7 +649,18 @@ async def leaderboard(ctx):
     medals = ["🥇", "🥈", "🥉"]
     for i, (discord_id, net_worth) in enumerate(top_10):
         member = ctx.guild.get_member(int(discord_id))
-        name = member.display_name if member else f"User {discord_id}"
+        if member:
+            name = member.display_name
+        else:
+            try:
+                fetched = await ctx.guild.fetch_member(int(discord_id))
+                name = fetched.display_name
+            except Exception:
+                try:
+                    user = await bot.fetch_user(int(discord_id))
+                    name = user.name
+                except Exception:
+                    name = f"User {discord_id}"
         prefix = medals[i] if i < 3 else f"**#{i+1}**"
         embed.add_field(name=f"{prefix} {name}", value=f"${net_worth:,.2f}", inline=False)
 
@@ -1034,4 +1045,3 @@ async def clearwaitlist(ctx, ticker: str):
     await ctx.send(f"🗑️ Waitlist for **{ticker}** cleared.")
 
 bot.run(os.environ['DISCORD_TOKEN'])
-
