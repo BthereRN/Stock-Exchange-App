@@ -28,10 +28,10 @@ bot = commands.Bot(command_prefix="!", intents=intents, help_command=None)
 ADMIN_IDS = [909889735038746694]
 
 # 2. Database connection (PostgreSQL via Supabase)
-DATABASE_URL = os.environ['DATABASE_URL']
+SUPABASE_URL = os.environ['SUPABASE_URL']
 
 def make_connection():
-    c = psycopg2.connect(DATABASE_URL, sslmode='require', connect_timeout=10)
+    c = psycopg2.connect(SUPABASE_URL, sslmode='require', connect_timeout=10)
     c.autocommit = False
     return c
 
