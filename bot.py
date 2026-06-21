@@ -1,7 +1,8 @@
 
 import discord
 from discord.ext import commands, tasks
-import sqlite3
+import psycopg2
+import psycopg2.extras
 import os
 from datetime import datetime, timedelta
 from flask import Flask
@@ -26,27 +27,43 @@ bot = commands.Bot(command_prefix="!", intents=intents, help_command=None)
 
 ADMIN_IDS = [909889735038746694]
 
-# 2. Setup SQLite Database Structure
-conn = sqlite3.connect("stoneworks_exchange.db")
+# 2. Database connection (PostgreSQL via Supabase)
+DATABASE_URL = os.environ['DATABASE_URL']
+
+def make_connection():
+    c = psycopg2.connect(DATABASE_URL, sslmode='require', connect_timeout=10)
+    c.autocommit = False
+    return c
+
+conn = make_connection()
 cursor = conn.cursor()
 
+def ensure_connection():
+    global conn, cursor
+    try:
+        cursor.execute("SELECT 1")
+    except (psycopg2.OperationalError, psycopg2.InterfaceError, psycopg2.DatabaseError):
+        conn = make_connection()
+        cursor = conn.cursor()
+
+# 3. Create tables
 cursor.execute("""
 CREATE TABLE IF NOT EXISTS users (
     discord_id TEXT PRIMARY KEY,
-    cash REAL DEFAULT 0.0
+    cash DOUBLE PRECISION DEFAULT 0.0
 )""")
 
 cursor.execute("""
 CREATE TABLE IF NOT EXISTS stocks (
     ticker TEXT PRIMARY KEY,
     company_name TEXT,
-    current_price REAL,
+    current_price DOUBLE PRECISION,
     total_shares INTEGER DEFAULT 0,
     available_shares INTEGER DEFAULT 0,
-    company_networth REAL DEFAULT 0.0,
+    company_networth DOUBLE PRECISION DEFAULT 0.0,
     auto_price INTEGER DEFAULT 1,
     last_price_update TEXT,
-    previous_price REAL DEFAULT 0.0
+    previous_price DOUBLE PRECISION DEFAULT 0.0
 )""")
 
 cursor.execute("""
@@ -59,18 +76,18 @@ CREATE TABLE IF NOT EXISTS portfolios (
 
 cursor.execute("""
 CREATE TABLE IF NOT EXISTS transactions (
-    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    id SERIAL PRIMARY KEY,
     discord_id TEXT,
     ticker TEXT,
     type TEXT,
     shares INTEGER,
-    price REAL,
+    price DOUBLE PRECISION,
     timestamp TEXT
 )""")
 
 cursor.execute("""
 CREATE TABLE IF NOT EXISTS waitlist (
-    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    id SERIAL PRIMARY KEY,
     discord_id TEXT,
     ticker TEXT,
     shares INTEGER,
@@ -85,34 +102,37 @@ CREATE TABLE IF NOT EXISTS config (
 
 conn.commit()
 
-# Migrate existing tables if columns are missing
+# Migrate: add any missing columns (safe to run on existing DB)
 for col, col_type in [
-    ("total_shares",     "INTEGER DEFAULT 0"),
-    ("available_shares", "INTEGER DEFAULT 0"),
-    ("company_networth", "REAL DEFAULT 0.0"),
-    ("auto_price",       "INTEGER DEFAULT 1"),
-    ("last_price_update","TEXT"),
-    ("previous_price",   "REAL DEFAULT 0.0"),
+    ("total_shares",      "INTEGER DEFAULT 0"),
+    ("available_shares",  "INTEGER DEFAULT 0"),
+    ("company_networth",  "DOUBLE PRECISION DEFAULT 0.0"),
+    ("auto_price",        "INTEGER DEFAULT 1"),
+    ("last_price_update", "TEXT"),
+    ("previous_price",    "DOUBLE PRECISION DEFAULT 0.0"),
 ]:
     try:
-        cursor.execute(f"ALTER TABLE stocks ADD COLUMN {col} {col_type}")
+        cursor.execute(f"ALTER TABLE stocks ADD COLUMN IF NOT EXISTS {col} {col_type}")
         conn.commit()
-    except sqlite3.OperationalError:
-        pass
+    except Exception:
+        conn.rollback()
 
 # Seed default config values
-cursor.execute("INSERT OR IGNORE INTO config (key, value) VALUES ('fee_percent', '2.0')")
-cursor.execute("INSERT OR IGNORE INTO config (key, value) VALUES ('price_channel_id', '')")
+cursor.execute("INSERT INTO config (key, value) VALUES ('fee_percent', '2.0') ON CONFLICT (key) DO NOTHING")
+cursor.execute("INSERT INTO config (key, value) VALUES ('price_channel_id', '') ON CONFLICT (key) DO NOTHING")
+cursor.execute("INSERT INTO config (key, value) VALUES ('price_interval_days', '3') ON CONFLICT (key) DO NOTHING")
 conn.commit()
 
 # ── Helpers ──────────────────────────────────────────────────────────────────
 
 def is_registered(discord_id):
-    cursor.execute("SELECT cash FROM users WHERE discord_id = ?", (str(discord_id),))
+    ensure_connection()
+    cursor.execute("SELECT cash FROM users WHERE discord_id = %s", (str(discord_id),))
     return cursor.fetchone() is not None
 
 def get_config(key):
-    cursor.execute("SELECT value FROM config WHERE key = ?", (key,))
+    ensure_connection()
+    cursor.execute("SELECT value FROM config WHERE key = %s", (key,))
     row = cursor.fetchone()
     return row[0] if row else None
 
@@ -125,15 +145,16 @@ def get_fee():
 def credit_fee_to_admin(amount):
     """Add fee amount to the first admin's account (creates account if missing)."""
     admin_id = str(ADMIN_IDS[0])
-    cursor.execute("SELECT cash FROM users WHERE discord_id = ?", (admin_id,))
+    cursor.execute("SELECT cash FROM users WHERE discord_id = %s", (admin_id,))
     row = cursor.fetchone()
     if row:
-        cursor.execute("UPDATE users SET cash = cash + ? WHERE discord_id = ?", (amount, admin_id))
+        cursor.execute("UPDATE users SET cash = cash + %s WHERE discord_id = %s", (amount, admin_id))
     else:
-        cursor.execute("INSERT INTO users (discord_id, cash) VALUES (?, ?)", (admin_id, amount))
+        cursor.execute("INSERT INTO users (discord_id, cash) VALUES (%s, %s)", (admin_id, amount))
 
 async def process_waitlist(ticker, guild):
-    cursor.execute("SELECT available_shares, current_price FROM stocks WHERE ticker = ?", (ticker,))
+    ensure_connection()
+    cursor.execute("SELECT available_shares, current_price FROM stocks WHERE ticker = %s", (ticker,))
     stock = cursor.fetchone()
     if not stock:
         return
@@ -142,7 +163,7 @@ async def process_waitlist(ticker, guild):
     fee_rate = get_fee()
 
     cursor.execute(
-        "SELECT id, discord_id, shares FROM waitlist WHERE ticker = ? ORDER BY queued_at ASC",
+        "SELECT id, discord_id, shares FROM waitlist WHERE ticker = %s ORDER BY queued_at ASC",
         (ticker,)
     )
     queue = cursor.fetchall()
@@ -156,31 +177,31 @@ async def process_waitlist(ticker, guild):
         fee = round(base_cost * fee_rate, 2)
         total_cost = base_cost + fee
 
-        cursor.execute("SELECT cash FROM users WHERE discord_id = ?", (discord_id,))
+        cursor.execute("SELECT cash FROM users WHERE discord_id = %s", (discord_id,))
         user = cursor.fetchone()
         if not user or user[0] < total_cost:
             continue
 
-        cursor.execute("UPDATE users SET cash = cash - ? WHERE discord_id = ?", (total_cost, discord_id))
-        cursor.execute("UPDATE stocks SET available_shares = available_shares - ? WHERE ticker = ?", (can_fill, ticker))
+        cursor.execute("UPDATE users SET cash = cash - %s WHERE discord_id = %s", (total_cost, discord_id))
+        cursor.execute("UPDATE stocks SET available_shares = available_shares - %s WHERE ticker = %s", (can_fill, ticker))
         credit_fee_to_admin(fee)
 
-        cursor.execute("SELECT shares FROM portfolios WHERE discord_id = ? AND ticker = ?", (discord_id, ticker))
+        cursor.execute("SELECT shares FROM portfolios WHERE discord_id = %s AND ticker = %s", (discord_id, ticker))
         p_row = cursor.fetchone()
         if p_row:
-            cursor.execute("UPDATE portfolios SET shares = ? WHERE discord_id = ? AND ticker = ?", (p_row[0] + can_fill, discord_id, ticker))
+            cursor.execute("UPDATE portfolios SET shares = %s WHERE discord_id = %s AND ticker = %s", (p_row[0] + can_fill, discord_id, ticker))
         else:
-            cursor.execute("INSERT INTO portfolios (discord_id, ticker, shares) VALUES (?, ?, ?)", (discord_id, ticker, can_fill))
+            cursor.execute("INSERT INTO portfolios (discord_id, ticker, shares) VALUES (%s, %s, %s)", (discord_id, ticker, can_fill))
 
         cursor.execute(
-            "INSERT INTO transactions (discord_id, ticker, type, shares, price, timestamp) VALUES (?, ?, ?, ?, ?, ?)",
+            "INSERT INTO transactions (discord_id, ticker, type, shares, price, timestamp) VALUES (%s, %s, %s, %s, %s, %s)",
             (discord_id, ticker, "buy", can_fill, price, datetime.utcnow().isoformat())
         )
 
         if can_fill >= requested_shares:
-            cursor.execute("DELETE FROM waitlist WHERE id = ?", (entry_id,))
+            cursor.execute("DELETE FROM waitlist WHERE id = %s", (entry_id,))
         else:
-            cursor.execute("UPDATE waitlist SET shares = shares - ? WHERE id = ?", (can_fill, entry_id))
+            cursor.execute("UPDATE waitlist SET shares = shares - %s WHERE id = %s", (can_fill, entry_id))
 
         conn.commit()
         available -= can_fill
@@ -200,8 +221,13 @@ async def process_waitlist(ticker, guild):
 
 @tasks.loop(hours=1)
 async def auto_price_task():
+    ensure_connection()
     now = datetime.utcnow()
-    three_days_ago = (now - timedelta(days=3)).isoformat()
+    try:
+        interval_days = int(get_config("price_interval_days") or 3)
+    except (ValueError, TypeError):
+        interval_days = 3
+    interval_ago = (now - timedelta(days=interval_days)).isoformat()
 
     cursor.execute("SELECT ticker, company_name, current_price, total_shares, last_price_update FROM stocks WHERE auto_price = 1")
     stocks = cursor.fetchall()
@@ -215,48 +241,42 @@ async def auto_price_task():
             pass
 
     for ticker, name, price, total, last_update in stocks:
-        # Skip if updated less than 3 days ago
         if last_update:
             try:
-                if datetime.fromisoformat(last_update) > now - timedelta(days=3):
+                if datetime.fromisoformat(last_update) > now - timedelta(days=interval_days):
                     continue
             except ValueError:
                 pass
 
-        # Calculate net demand over the past 3 days
         cursor.execute(
-            "SELECT SUM(shares) FROM transactions WHERE ticker = ? AND type = 'buy' AND timestamp >= ?",
-            (ticker, three_days_ago)
+            "SELECT SUM(shares) FROM transactions WHERE ticker = %s AND type = 'buy' AND timestamp >= %s",
+            (ticker, interval_ago)
         )
         bought = cursor.fetchone()[0] or 0
 
         cursor.execute(
-            "SELECT SUM(shares) FROM transactions WHERE ticker = ? AND type = 'sell' AND timestamp >= ?",
-            (ticker, three_days_ago)
+            "SELECT SUM(shares) FROM transactions WHERE ticker = %s AND type = 'sell' AND timestamp >= %s",
+            (ticker, interval_ago)
         )
         sold = cursor.fetchone()[0] or 0
 
         net_flow = bought - sold
 
-        # If no trading activity at all, skip price change
         if bought == 0 and sold == 0:
-            cursor.execute("UPDATE stocks SET last_price_update = ? WHERE ticker = ?", (now.isoformat(), ticker))
+            cursor.execute("UPDATE stocks SET last_price_update = %s WHERE ticker = %s", (now.isoformat(), ticker))
             conn.commit()
             continue
 
-        # Demand ratio: net flow as % of total shares, sensitivity factor 0.5
         if total > 0:
             demand_ratio = (net_flow / total) * 0.5
         else:
             demand_ratio = 0
 
-        # Cap change at ±25% per cycle
         demand_ratio = max(-0.25, min(0.25, demand_ratio))
-
         new_price = round(max(0.01, price * (1 + demand_ratio)), 2)
 
         cursor.execute(
-            "UPDATE stocks SET current_price = ?, previous_price = ?, last_price_update = ? WHERE ticker = ?",
+            "UPDATE stocks SET current_price = %s, previous_price = %s, last_price_update = %s WHERE ticker = %s",
             (new_price, price, now.isoformat(), ticker)
         )
         conn.commit()
@@ -269,7 +289,7 @@ async def auto_price_task():
             await channel.send(
                 f"{direction} **Market Update — {name} ({ticker})**\n"
                 f"Price adjusted from **${price:,.2f}** → **${new_price:,.2f}** ({pct:+.1f}%) "
-                f"based on 3-day trading activity."
+                f"based on {interval_days}-day trading activity."
             )
 
 # ── Bot Events ────────────────────────────────────────────────────────────────
@@ -283,7 +303,6 @@ async def on_ready():
 
 @bot.command(name="help")
 async def help_command(ctx):
-    """Show all available user commands."""
     embed = discord.Embed(
         title="📖 Stoneworks Exchange — Command Guide",
         description="Here are all the commands available to you:",
@@ -304,7 +323,7 @@ async def help_command(ctx):
 
 @bot.command()
 async def market(ctx):
-    """List all available companies on the stock exchange."""
+    ensure_connection()
     cursor.execute("SELECT ticker, company_name, current_price, available_shares, total_shares, auto_price, previous_price FROM stocks")
     all_stocks = cursor.fetchall()
 
@@ -332,19 +351,19 @@ async def market(ctx):
 
 @bot.command()
 async def balance(ctx):
-    """Check your cash and stock holdings."""
+    ensure_connection()
     if not is_registered(ctx.author.id):
         await ctx.send("❌ You do not have an active exchange account. Please open a support ticket, send your in-game payment screenshot, and an admin will open your account!")
         return
 
-    cursor.execute("SELECT cash FROM users WHERE discord_id = ?", (str(ctx.author.id),))
+    cursor.execute("SELECT cash FROM users WHERE discord_id = %s", (str(ctx.author.id),))
     cash = cursor.fetchone()[0]
 
     cursor.execute("""
         SELECT p.ticker, p.shares, s.current_price
         FROM portfolios p
         JOIN stocks s ON p.ticker = s.ticker
-        WHERE p.discord_id = ? AND p.shares > 0
+        WHERE p.discord_id = %s AND p.shares > 0
     """, (str(ctx.author.id),))
     holdings = cursor.fetchall()
 
@@ -367,7 +386,7 @@ async def balance(ctx):
 
 @bot.command()
 async def buy(ctx, ticker: str, shares: int):
-    """Buy shares of a stock. Usage: !buy OBK 10"""
+    ensure_connection()
     if not is_registered(ctx.author.id):
         await ctx.send("❌ You do not have an account yet.")
         return
@@ -377,7 +396,7 @@ async def buy(ctx, ticker: str, shares: int):
 
     ticker = ticker.upper()
 
-    cursor.execute("SELECT current_price, available_shares FROM stocks WHERE ticker = ?", (ticker,))
+    cursor.execute("SELECT current_price, available_shares FROM stocks WHERE ticker = %s", (ticker,))
     row = cursor.fetchone()
     if not row:
         await ctx.send(f"❌ Ticker **{ticker}** does not exist.")
@@ -404,7 +423,7 @@ async def buy(ctx, ticker: str, shares: int):
     fee = round(base_cost * fee_rate, 2)
     total_cost = base_cost + fee
 
-    cursor.execute("SELECT cash FROM users WHERE discord_id = ?", (str(ctx.author.id),))
+    cursor.execute("SELECT cash FROM users WHERE discord_id = %s", (str(ctx.author.id),))
     cash = cursor.fetchone()[0]
 
     if cash < total_cost:
@@ -414,19 +433,19 @@ async def buy(ctx, ticker: str, shares: int):
         )
         return
 
-    cursor.execute("UPDATE users SET cash = cash - ? WHERE discord_id = ?", (total_cost, str(ctx.author.id)))
-    cursor.execute("UPDATE stocks SET available_shares = available_shares - ? WHERE ticker = ?", (shares, ticker))
+    cursor.execute("UPDATE users SET cash = cash - %s WHERE discord_id = %s", (total_cost, str(ctx.author.id)))
+    cursor.execute("UPDATE stocks SET available_shares = available_shares - %s WHERE ticker = %s", (shares, ticker))
     credit_fee_to_admin(fee)
 
-    cursor.execute("SELECT shares FROM portfolios WHERE discord_id = ? AND ticker = ?", (str(ctx.author.id), ticker))
+    cursor.execute("SELECT shares FROM portfolios WHERE discord_id = %s AND ticker = %s", (str(ctx.author.id), ticker))
     p_row = cursor.fetchone()
     if p_row:
-        cursor.execute("UPDATE portfolios SET shares = ? WHERE discord_id = ? AND ticker = ?", (p_row[0] + shares, str(ctx.author.id), ticker))
+        cursor.execute("UPDATE portfolios SET shares = %s WHERE discord_id = %s AND ticker = %s", (p_row[0] + shares, str(ctx.author.id), ticker))
     else:
-        cursor.execute("INSERT INTO portfolios (discord_id, ticker, shares) VALUES (?, ?, ?)", (str(ctx.author.id), ticker, shares))
+        cursor.execute("INSERT INTO portfolios (discord_id, ticker, shares) VALUES (%s, %s, %s)", (str(ctx.author.id), ticker, shares))
 
     cursor.execute(
-        "INSERT INTO transactions (discord_id, ticker, type, shares, price, timestamp) VALUES (?, ?, ?, ?, ?, ?)",
+        "INSERT INTO transactions (discord_id, ticker, type, shares, price, timestamp) VALUES (%s, %s, %s, %s, %s, %s)",
         (str(ctx.author.id), ticker, "buy", shares, price, datetime.utcnow().isoformat())
     )
 
@@ -438,7 +457,7 @@ async def buy(ctx, ticker: str, shares: int):
 
 @bot.command()
 async def sell(ctx, ticker: str, shares: int):
-    """Sell shares back to the pool. Usage: !sell OBK 5"""
+    ensure_connection()
     if not is_registered(ctx.author.id):
         await ctx.send("❌ You do not have an account yet.")
         return
@@ -448,13 +467,13 @@ async def sell(ctx, ticker: str, shares: int):
 
     ticker = ticker.upper()
 
-    cursor.execute("SELECT shares FROM portfolios WHERE discord_id = ? AND ticker = ?", (str(ctx.author.id), ticker))
+    cursor.execute("SELECT shares FROM portfolios WHERE discord_id = %s AND ticker = %s", (str(ctx.author.id), ticker))
     p_row = cursor.fetchone()
     if not p_row or p_row[0] < shares:
         await ctx.send(f"❌ You do not own enough shares of **{ticker}**.")
         return
 
-    cursor.execute("SELECT current_price FROM stocks WHERE ticker = ?", (ticker,))
+    cursor.execute("SELECT current_price FROM stocks WHERE ticker = %s", (ticker,))
     price = cursor.fetchone()[0]
 
     fee_rate = get_fee()
@@ -464,16 +483,16 @@ async def sell(ctx, ticker: str, shares: int):
 
     new_shares = p_row[0] - shares
     if new_shares == 0:
-        cursor.execute("DELETE FROM portfolios WHERE discord_id = ? AND ticker = ?", (str(ctx.author.id), ticker))
+        cursor.execute("DELETE FROM portfolios WHERE discord_id = %s AND ticker = %s", (str(ctx.author.id), ticker))
     else:
-        cursor.execute("UPDATE portfolios SET shares = ? WHERE discord_id = ? AND ticker = ?", (new_shares, str(ctx.author.id), ticker))
+        cursor.execute("UPDATE portfolios SET shares = %s WHERE discord_id = %s AND ticker = %s", (new_shares, str(ctx.author.id), ticker))
 
-    cursor.execute("UPDATE stocks SET available_shares = available_shares + ? WHERE ticker = ?", (shares, ticker))
-    cursor.execute("UPDATE users SET cash = cash + ? WHERE discord_id = ?", (payout, str(ctx.author.id)))
+    cursor.execute("UPDATE stocks SET available_shares = available_shares + %s WHERE ticker = %s", (shares, ticker))
+    cursor.execute("UPDATE users SET cash = cash + %s WHERE discord_id = %s", (payout, str(ctx.author.id)))
     credit_fee_to_admin(fee)
 
     cursor.execute(
-        "INSERT INTO transactions (discord_id, ticker, type, shares, price, timestamp) VALUES (?, ?, ?, ?, ?, ?)",
+        "INSERT INTO transactions (discord_id, ticker, type, shares, price, timestamp) VALUES (%s, %s, %s, %s, %s, %s)",
         (str(ctx.author.id), ticker, "sell", shares, price, datetime.utcnow().isoformat())
     )
 
@@ -487,12 +506,12 @@ async def sell(ctx, ticker: str, shares: int):
 
 @bot.command()
 async def companyinfo(ctx, ticker: str):
-    """View detailed info about a listed company. Usage: !companyinfo OBK"""
+    ensure_connection()
     ticker = ticker.upper()
 
     cursor.execute("""
         SELECT company_name, current_price, total_shares, available_shares, company_networth, auto_price, last_price_update
-        FROM stocks WHERE ticker = ?
+        FROM stocks WHERE ticker = %s
     """, (ticker,))
     row = cursor.fetchone()
     if not row:
@@ -512,7 +531,7 @@ async def companyinfo(ctx, ticker: str):
     embed.add_field(name="Available in Pool", value=f"{available:,}", inline=True)
     embed.add_field(name="Shares Held", value=f"{held_publicly:,}", inline=True)
 
-    cursor.execute("SELECT discord_id, shares FROM portfolios WHERE ticker = ? ORDER BY shares DESC LIMIT 1", (ticker,))
+    cursor.execute("SELECT discord_id, shares FROM portfolios WHERE ticker = %s ORDER BY shares DESC LIMIT 1", (ticker,))
     top_holder = cursor.fetchone()
     if top_holder:
         member = ctx.guild.get_member(int(top_holder[0]))
@@ -520,10 +539,14 @@ async def companyinfo(ctx, ticker: str):
         pct = (top_holder[1] / total * 100) if total > 0 else 0
         embed.add_field(name="Largest Shareholder", value=f"{holder_name} ({top_holder[1]:,} shares — {pct:.1f}%)", inline=False)
 
-    pricing_mode = "🤖 Auto (3-day cycle)"
+    try:
+        interval_days = int(get_config("price_interval_days") or 3)
+    except (ValueError, TypeError):
+        interval_days = 3
+    pricing_mode = f"🤖 Auto ({interval_days}-day cycle)"
     if last_update:
         try:
-            next_update = datetime.fromisoformat(last_update) + timedelta(days=3)
+            next_update = datetime.fromisoformat(last_update) + timedelta(days=interval_days)
             days_left = max(0, (next_update - datetime.utcnow()).days)
             pricing_mode += f" — next update in ~{days_left}d"
         except ValueError:
@@ -538,7 +561,7 @@ async def companyinfo(ctx, ticker: str):
 
 @bot.command()
 async def joinwaitlist(ctx, ticker: str, shares: int):
-    """Join the waitlist for a sold-out stock. Usage: !joinwaitlist OBK 10"""
+    ensure_connection()
     if not is_registered(ctx.author.id):
         await ctx.send("❌ You do not have an account yet.")
         return
@@ -548,7 +571,7 @@ async def joinwaitlist(ctx, ticker: str, shares: int):
 
     ticker = ticker.upper()
 
-    cursor.execute("SELECT company_name, available_shares, current_price FROM stocks WHERE ticker = ?", (ticker,))
+    cursor.execute("SELECT company_name, available_shares, current_price FROM stocks WHERE ticker = %s", (ticker,))
     row = cursor.fetchone()
     if not row:
         await ctx.send(f"❌ Ticker **{ticker}** does not exist.")
@@ -560,21 +583,21 @@ async def joinwaitlist(ctx, ticker: str, shares: int):
         await ctx.send(f"✅ **{ticker}** has shares available right now! Use `!buy {ticker} {shares}` to purchase them directly.")
         return
 
-    cursor.execute("SELECT id FROM waitlist WHERE discord_id = ? AND ticker = ?", (str(ctx.author.id), ticker))
+    cursor.execute("SELECT id FROM waitlist WHERE discord_id = %s AND ticker = %s", (str(ctx.author.id), ticker))
     existing = cursor.fetchone()
     if existing:
-        cursor.execute("UPDATE waitlist SET shares = ? WHERE discord_id = ? AND ticker = ?", (shares, str(ctx.author.id), ticker))
+        cursor.execute("UPDATE waitlist SET shares = %s WHERE discord_id = %s AND ticker = %s", (shares, str(ctx.author.id), ticker))
         conn.commit()
         await ctx.send(f"🔄 Updated your waitlist order for **{ticker}** to **{shares:,}** shares.")
         return
 
     cursor.execute(
-        "INSERT INTO waitlist (discord_id, ticker, shares, queued_at) VALUES (?, ?, ?, ?)",
+        "INSERT INTO waitlist (discord_id, ticker, shares, queued_at) VALUES (%s, %s, %s, %s)",
         (str(ctx.author.id), ticker, shares, datetime.utcnow().isoformat())
     )
     conn.commit()
 
-    cursor.execute("SELECT COUNT(*) FROM waitlist WHERE ticker = ?", (ticker,))
+    cursor.execute("SELECT COUNT(*) FROM waitlist WHERE ticker = %s", (ticker,))
     position = cursor.fetchone()[0]
 
     await ctx.send(
@@ -584,10 +607,10 @@ async def joinwaitlist(ctx, ticker: str, shares: int):
 
 @bot.command()
 async def waitlistpos(ctx, ticker: str):
-    """Check your position in a stock's waitlist. Usage: !waitlistpos OBK"""
+    ensure_connection()
     ticker = ticker.upper()
 
-    cursor.execute("SELECT id, shares FROM waitlist WHERE discord_id = ? AND ticker = ?", (str(ctx.author.id), ticker))
+    cursor.execute("SELECT id, shares FROM waitlist WHERE discord_id = %s AND ticker = %s", (str(ctx.author.id), ticker))
     entry = cursor.fetchone()
     if not entry:
         await ctx.send(f"You are not on the waitlist for **{ticker}**.")
@@ -595,11 +618,11 @@ async def waitlistpos(ctx, ticker: str):
 
     entry_id, shares = entry
     cursor.execute(
-        "SELECT COUNT(*) FROM waitlist WHERE ticker = ? AND queued_at <= (SELECT queued_at FROM waitlist WHERE id = ?)",
+        "SELECT COUNT(*) FROM waitlist WHERE ticker = %s AND queued_at <= (SELECT queued_at FROM waitlist WHERE id = %s)",
         (ticker, entry_id)
     )
     position = cursor.fetchone()[0]
-    cursor.execute("SELECT current_price FROM stocks WHERE ticker = ?", (ticker,))
+    cursor.execute("SELECT current_price FROM stocks WHERE ticker = %s", (ticker,))
     price = cursor.fetchone()[0]
 
     fee_rate = get_fee()
@@ -611,18 +634,19 @@ async def waitlistpos(ctx, ticker: str):
 
 @bot.command()
 async def leavewaitlist(ctx, ticker: str):
-    """Leave the waitlist for a stock. Usage: !leavewaitlist OBK"""
+    ensure_connection()
     ticker = ticker.upper()
-    cursor.execute("DELETE FROM waitlist WHERE discord_id = ? AND ticker = ?", (str(ctx.author.id), ticker))
+    cursor.execute("DELETE FROM waitlist WHERE discord_id = %s AND ticker = %s", (str(ctx.author.id), ticker))
     if cursor.rowcount > 0:
         conn.commit()
         await ctx.send(f"✅ You have been removed from the **{ticker}** waitlist.")
     else:
+        conn.rollback()
         await ctx.send(f"You were not on the waitlist for **{ticker}**.")
 
 @bot.command()
 async def leaderboard(ctx):
-    """Show the top 10 users ranked by total net worth."""
+    ensure_connection()
     cursor.execute("SELECT discord_id, cash FROM users")
     all_users = cursor.fetchall()
 
@@ -636,7 +660,7 @@ async def leaderboard(ctx):
             SELECT p.shares, s.current_price
             FROM portfolios p
             JOIN stocks s ON p.ticker = s.ticker
-            WHERE p.discord_id = ? AND p.shares > 0
+            WHERE p.discord_id = %s AND p.shares > 0
         """, (discord_id,))
         holdings = cursor.fetchall()
         stock_value = sum(s * p for s, p in holdings)
@@ -670,7 +694,7 @@ async def leaderboard(ctx):
 
 @bot.command()
 async def deposit(ctx, member: discord.Member, amount: float):
-    """[Admin] Create an account or fund a verified deposit. Usage: !deposit @Username 5000"""
+    ensure_connection()
     if ctx.author.id not in ADMIN_IDS:
         await ctx.send("❌ Only the exchange owner can process deposits.")
         return
@@ -678,22 +702,22 @@ async def deposit(ctx, member: discord.Member, amount: float):
         await ctx.send("❌ Amount must be positive.")
         return
 
-    cursor.execute("SELECT cash FROM users WHERE discord_id = ?", (str(member.id),))
+    cursor.execute("SELECT cash FROM users WHERE discord_id = %s", (str(member.id),))
     row = cursor.fetchone()
 
     if row:
         new_balance = row[0] + amount
-        cursor.execute("UPDATE users SET cash = ? WHERE discord_id = ?", (new_balance, str(member.id)))
+        cursor.execute("UPDATE users SET cash = %s WHERE discord_id = %s", (new_balance, str(member.id)))
         await ctx.send(f"💰 **Deposit Approved!** Added **${amount:,.2f}** to {member.mention}'s account. New Balance: **${new_balance:,.2f}**.")
     else:
-        cursor.execute("INSERT INTO users (discord_id, cash) VALUES (?, ?)", (str(member.id), amount))
+        cursor.execute("INSERT INTO users (discord_id, cash) VALUES (%s, %s)", (str(member.id), amount))
         await ctx.send(f"🏛️ **Account Created!** {member.mention} has been added to the exchange with a starting balance of **${amount:,.2f}**.")
 
     conn.commit()
 
 @bot.command()
 async def withdraw(ctx, member: discord.Member, amount: float):
-    """[Admin] Deduct funds from a user's account. Usage: !withdraw @Username 1000"""
+    ensure_connection()
     if ctx.author.id not in ADMIN_IDS:
         await ctx.send("❌ Only the exchange owner can process withdrawals.")
         return
@@ -701,7 +725,7 @@ async def withdraw(ctx, member: discord.Member, amount: float):
         await ctx.send("❌ Amount must be positive.")
         return
 
-    cursor.execute("SELECT cash FROM users WHERE discord_id = ?", (str(member.id),))
+    cursor.execute("SELECT cash FROM users WHERE discord_id = %s", (str(member.id),))
     row = cursor.fetchone()
 
     if not row:
@@ -712,18 +736,18 @@ async def withdraw(ctx, member: discord.Member, amount: float):
         return
 
     new_balance = row[0] - amount
-    cursor.execute("UPDATE users SET cash = ? WHERE discord_id = ?", (new_balance, str(member.id)))
+    cursor.execute("UPDATE users SET cash = %s WHERE discord_id = %s", (new_balance, str(member.id)))
     conn.commit()
     await ctx.send(f"🏦 **Withdrawal Processed!** Deducted **${amount:,.2f}** from {member.mention}'s account. New Balance: **${new_balance:,.2f}**.")
 
 @bot.command()
 async def portfolio(ctx, member: discord.Member):
-    """[Admin] View any user's balance and holdings. Usage: !portfolio @Username"""
+    ensure_connection()
     if ctx.author.id not in ADMIN_IDS:
         await ctx.send("❌ Denied.")
         return
 
-    cursor.execute("SELECT cash FROM users WHERE discord_id = ?", (str(member.id),))
+    cursor.execute("SELECT cash FROM users WHERE discord_id = %s", (str(member.id),))
     row = cursor.fetchone()
     if not row:
         await ctx.send(f"❌ {member.mention} does not have an account.")
@@ -734,7 +758,7 @@ async def portfolio(ctx, member: discord.Member):
         SELECT p.ticker, p.shares, s.current_price
         FROM portfolios p
         JOIN stocks s ON p.ticker = s.ticker
-        WHERE p.discord_id = ? AND p.shares > 0
+        WHERE p.discord_id = %s AND p.shares > 0
     """, (str(member.id),))
     holdings = cursor.fetchall()
 
@@ -757,7 +781,7 @@ async def portfolio(ctx, member: discord.Member):
 
 @bot.command()
 async def grant(ctx, member: discord.Member, ticker: str, shares: int):
-    """[Admin] Grant founder shares to a user without drawing from the public pool. Usage: !grant @Username OBK 20"""
+    ensure_connection()
     if ctx.author.id not in ADMIN_IDS:
         await ctx.send("❌ Denied.")
         return
@@ -766,7 +790,7 @@ async def grant(ctx, member: discord.Member, ticker: str, shares: int):
         return
 
     ticker = ticker.upper()
-    cursor.execute("SELECT company_name, current_price FROM stocks WHERE ticker = ?", (ticker,))
+    cursor.execute("SELECT company_name, current_price FROM stocks WHERE ticker = %s", (ticker,))
     stock = cursor.fetchone()
     if not stock:
         await ctx.send(f"❌ Ticker **{ticker}** does not exist.")
@@ -778,14 +802,14 @@ async def grant(ctx, member: discord.Member, ticker: str, shares: int):
         await ctx.send(f"❌ {member.mention} does not have an exchange account. Use `!deposit` to create one first.")
         return
 
-    cursor.execute("SELECT shares FROM portfolios WHERE discord_id = ? AND ticker = ?", (str(member.id), ticker))
+    cursor.execute("SELECT shares FROM portfolios WHERE discord_id = %s AND ticker = %s", (str(member.id), ticker))
     p_row = cursor.fetchone()
     if p_row:
-        cursor.execute("UPDATE portfolios SET shares = ? WHERE discord_id = ? AND ticker = ?", (p_row[0] + shares, str(member.id), ticker))
+        cursor.execute("UPDATE portfolios SET shares = %s WHERE discord_id = %s AND ticker = %s", (p_row[0] + shares, str(member.id), ticker))
     else:
-        cursor.execute("INSERT INTO portfolios (discord_id, ticker, shares) VALUES (?, ?, ?)", (str(member.id), ticker, shares))
+        cursor.execute("INSERT INTO portfolios (discord_id, ticker, shares) VALUES (%s, %s, %s)", (str(member.id), ticker, shares))
 
-    cursor.execute("UPDATE stocks SET total_shares = total_shares + ? WHERE ticker = ?", (shares, ticker))
+    cursor.execute("UPDATE stocks SET total_shares = total_shares + %s WHERE ticker = %s", (shares, ticker))
     conn.commit()
     await ctx.send(
         f"🎟️ **Shares Granted!** {member.mention} has received **{shares:,} founder shares** of **{company_name} ({ticker})**. "
@@ -794,7 +818,7 @@ async def grant(ctx, member: discord.Member, ticker: str, shares: int):
 
 @bot.command()
 async def addstock(ctx, ticker: str, price: float, total_shares: int, *, name: str):
-    """[Admin] List a new company. Usage: !addstock OBK 15.5 100 Obelisk Industries"""
+    ensure_connection()
     if ctx.author.id not in ADMIN_IDS:
         await ctx.send("❌ Denied.")
         return
@@ -806,17 +830,18 @@ async def addstock(ctx, ticker: str, price: float, total_shares: int, *, name: s
     now = datetime.utcnow().isoformat()
     try:
         cursor.execute(
-            "INSERT INTO stocks (ticker, company_name, current_price, previous_price, total_shares, available_shares, auto_price, last_price_update) VALUES (?, ?, ?, ?, ?, ?, 1, ?)",
+            "INSERT INTO stocks (ticker, company_name, current_price, previous_price, total_shares, available_shares, auto_price, last_price_update) VALUES (%s, %s, %s, %s, %s, %s, 1, %s)",
             (ticker, name, price, price, total_shares, total_shares, now)
         )
         conn.commit()
         await ctx.send(f"🏢 Listed **{name} ({ticker})** at **${price:,.2f}** per share with **{total_shares:,}** total shares. Auto-pricing enabled.")
-    except sqlite3.IntegrityError:
+    except psycopg2.IntegrityError:
+        conn.rollback()
         await ctx.send(f"❌ Ticker **{ticker}** already exists.")
 
 @bot.command()
 async def addshares(ctx, ticker: str, amount: int):
-    """[Admin] Add more shares to a company's pool. Usage: !addshares OBK 50"""
+    ensure_connection()
     if ctx.author.id not in ADMIN_IDS:
         await ctx.send("❌ Denied.")
         return
@@ -825,7 +850,7 @@ async def addshares(ctx, ticker: str, amount: int):
         return
 
     ticker = ticker.upper()
-    cursor.execute("SELECT company_name, total_shares, available_shares FROM stocks WHERE ticker = ?", (ticker,))
+    cursor.execute("SELECT company_name, total_shares, available_shares FROM stocks WHERE ticker = %s", (ticker,))
     row = cursor.fetchone()
     if not row:
         await ctx.send(f"❌ Ticker **{ticker}** does not exist.")
@@ -833,7 +858,7 @@ async def addshares(ctx, ticker: str, amount: int):
 
     name, total, available = row
     cursor.execute(
-        "UPDATE stocks SET total_shares = total_shares + ?, available_shares = available_shares + ? WHERE ticker = ?",
+        "UPDATE stocks SET total_shares = total_shares + %s, available_shares = available_shares + %s WHERE ticker = %s",
         (amount, amount, ticker)
     )
     conn.commit()
@@ -842,13 +867,13 @@ async def addshares(ctx, ticker: str, amount: int):
 
 @bot.command()
 async def removestock(ctx, ticker: str):
-    """[Admin] Delist a company and liquidate all holders. Usage: !removestock OBK"""
+    ensure_connection()
     if ctx.author.id not in ADMIN_IDS:
         await ctx.send("❌ Denied.")
         return
 
     ticker = ticker.upper()
-    cursor.execute("SELECT company_name, current_price FROM stocks WHERE ticker = ?", (ticker,))
+    cursor.execute("SELECT company_name, current_price FROM stocks WHERE ticker = %s", (ticker,))
     stock = cursor.fetchone()
     if not stock:
         await ctx.send(f"❌ Ticker **{ticker}** does not exist.")
@@ -856,15 +881,15 @@ async def removestock(ctx, ticker: str):
 
     company_name, price = stock
 
-    cursor.execute("SELECT discord_id, shares FROM portfolios WHERE ticker = ?", (ticker,))
+    cursor.execute("SELECT discord_id, shares FROM portfolios WHERE ticker = %s", (ticker,))
     holders = cursor.fetchall()
 
     for discord_id, shares in holders:
-        cursor.execute("UPDATE users SET cash = cash + ? WHERE discord_id = ?", (shares * price, discord_id))
-        cursor.execute("DELETE FROM portfolios WHERE discord_id = ? AND ticker = ?", (discord_id, ticker))
+        cursor.execute("UPDATE users SET cash = cash + %s WHERE discord_id = %s", (shares * price, discord_id))
+        cursor.execute("DELETE FROM portfolios WHERE discord_id = %s AND ticker = %s", (discord_id, ticker))
 
-    cursor.execute("DELETE FROM waitlist WHERE ticker = ?", (ticker,))
-    cursor.execute("DELETE FROM stocks WHERE ticker = ?", (ticker,))
+    cursor.execute("DELETE FROM waitlist WHERE ticker = %s", (ticker,))
+    cursor.execute("DELETE FROM stocks WHERE ticker = %s", (ticker,))
     conn.commit()
 
     msg = f"🗑️ **{company_name} ({ticker})** has been delisted."
@@ -876,26 +901,29 @@ async def removestock(ctx, ticker: str):
 
 @bot.command()
 async def setprice(ctx, ticker: str, new_price: float):
-    """[Admin] Manually set a stock price and reset the auto-price timer. Usage: !setprice OBK 22.0"""
+    ensure_connection()
     if ctx.author.id not in ADMIN_IDS:
         await ctx.send("❌ Denied.")
         return
     ticker = ticker.upper()
-    cursor.execute("SELECT current_price FROM stocks WHERE ticker = ?", (ticker,))
-    if not cursor.fetchone():
+    cursor.execute("SELECT current_price FROM stocks WHERE ticker = %s", (ticker,))
+    row = cursor.fetchone()
+    if not row:
         await ctx.send("❌ Ticker not found.")
         return
 
+    old_price = row[0]
     now = datetime.utcnow().isoformat()
-    cursor.execute("SELECT current_price FROM stocks WHERE ticker = ?", (ticker,))
-    old_price = cursor.fetchone()[0]
-    cursor.execute("UPDATE stocks SET current_price = ?, previous_price = ?, last_price_update = ? WHERE ticker = ?", (new_price, old_price, now, ticker))
+    cursor.execute(
+        "UPDATE stocks SET current_price = %s, previous_price = %s, last_price_update = %s WHERE ticker = %s",
+        (new_price, old_price, now, ticker)
+    )
     conn.commit()
     await ctx.send(f"🔧 **{ticker}** manually set to **${new_price:,.2f}**. Auto-price timer has been reset.")
 
 @bot.command()
 async def setnetworth(ctx, ticker: str, networth: float):
-    """[Admin] Set a company's in-game net worth. Usage: !setnetworth OBK 50000"""
+    ensure_connection()
     if ctx.author.id not in ADMIN_IDS:
         await ctx.send("❌ Denied.")
         return
@@ -904,19 +932,19 @@ async def setnetworth(ctx, ticker: str, networth: float):
         return
 
     ticker = ticker.upper()
-    cursor.execute("SELECT company_name FROM stocks WHERE ticker = ?", (ticker,))
+    cursor.execute("SELECT company_name FROM stocks WHERE ticker = %s", (ticker,))
     row = cursor.fetchone()
     if not row:
         await ctx.send(f"❌ Ticker **{ticker}** does not exist.")
         return
 
-    cursor.execute("UPDATE stocks SET company_networth = ? WHERE ticker = ?", (networth, ticker))
+    cursor.execute("UPDATE stocks SET company_networth = %s WHERE ticker = %s", (networth, ticker))
     conn.commit()
     await ctx.send(f"📋 **{row[0]} ({ticker})** net worth set to **${networth:,.2f}**.")
 
 @bot.command()
 async def autoprice(ctx, ticker: str, setting: str):
-    """[Admin] Enable or disable auto-pricing for a stock. Usage: !autoprice OBK on/off"""
+    ensure_connection()
     if ctx.author.id not in ADMIN_IDS:
         await ctx.send("❌ Denied.")
         return
@@ -927,21 +955,21 @@ async def autoprice(ctx, ticker: str, setting: str):
         await ctx.send("❌ Setting must be **on** or **off**.")
         return
 
-    cursor.execute("SELECT company_name FROM stocks WHERE ticker = ?", (ticker,))
+    cursor.execute("SELECT company_name FROM stocks WHERE ticker = %s", (ticker,))
     row = cursor.fetchone()
     if not row:
         await ctx.send(f"❌ Ticker **{ticker}** does not exist.")
         return
 
     val = 1 if setting == "on" else 0
-    cursor.execute("UPDATE stocks SET auto_price = ? WHERE ticker = ?", (val, ticker))
+    cursor.execute("UPDATE stocks SET auto_price = %s WHERE ticker = %s", (val, ticker))
     conn.commit()
     status = "🤖 enabled" if val else "🔧 disabled (manual only)"
     await ctx.send(f"Auto-pricing for **{row[0]} ({ticker})** is now {status}.")
 
 @bot.command()
 async def setfee(ctx, percent: float):
-    """[Admin] Set the exchange fee percentage for buys and sells. Usage: !setfee 3.0"""
+    ensure_connection()
     if ctx.author.id not in ADMIN_IDS:
         await ctx.send("❌ Denied.")
         return
@@ -949,24 +977,38 @@ async def setfee(ctx, percent: float):
         await ctx.send("❌ Fee must be between 0% and 20%.")
         return
 
-    cursor.execute("UPDATE config SET value = ? WHERE key = 'fee_percent'", (str(percent),))
+    cursor.execute("UPDATE config SET value = %s WHERE key = 'fee_percent'", (str(percent),))
     conn.commit()
     await ctx.send(f"💱 Exchange fee updated to **{percent}%**. Applies to all future buys and sells.")
 
 @bot.command()
 async def setpricechannel(ctx, channel: discord.TextChannel):
-    """[Admin] Set the channel where auto-price updates are announced. Usage: !setpricechannel #channel"""
+    ensure_connection()
     if ctx.author.id not in ADMIN_IDS:
         await ctx.send("❌ Denied.")
         return
 
-    cursor.execute("UPDATE config SET value = ? WHERE key = 'price_channel_id'", (str(channel.id),))
+    cursor.execute("UPDATE config SET value = %s WHERE key = 'price_channel_id'", (str(channel.id),))
     conn.commit()
     await ctx.send(f"📢 Auto-price announcements will now be posted in {channel.mention}.")
 
 @bot.command()
+async def setpriceinterval(ctx, days: int):
+    ensure_connection()
+    if ctx.author.id not in ADMIN_IDS:
+        await ctx.send("❌ Denied.")
+        return
+    if days < 1 or days > 30:
+        await ctx.send("❌ Interval must be between 1 and 30 days.")
+        return
+
+    cursor.execute("UPDATE config SET value = %s WHERE key = 'price_interval_days'", (str(days),))
+    conn.commit()
+    await ctx.send(f"⏱️ Auto-price cycle updated to every **{days} day(s)**. Takes effect on the next hourly check.")
+
+@bot.command()
 async def activityreport(ctx, days: int = 7):
-    """[Admin] View buy/sell volume per stock over the last N days. Usage: !activityreport 7"""
+    ensure_connection()
     if ctx.author.id not in ADMIN_IDS:
         await ctx.send("❌ Denied.")
         return
@@ -986,13 +1028,13 @@ async def activityreport(ctx, days: int = 7):
     )
 
     for ticker, name in all_stocks:
-        cursor.execute("SELECT SUM(shares) FROM transactions WHERE ticker = ? AND type = 'buy' AND timestamp >= ?", (ticker, since))
+        cursor.execute("SELECT SUM(shares) FROM transactions WHERE ticker = %s AND type = 'buy' AND timestamp >= %s", (ticker, since))
         bought = cursor.fetchone()[0] or 0
-        cursor.execute("SELECT SUM(shares) FROM transactions WHERE ticker = ? AND type = 'sell' AND timestamp >= ?", (ticker, since))
+        cursor.execute("SELECT SUM(shares) FROM transactions WHERE ticker = %s AND type = 'sell' AND timestamp >= %s", (ticker, since))
         sold = cursor.fetchone()[0] or 0
-        cursor.execute("SELECT available_shares, total_shares, current_price, auto_price FROM stocks WHERE ticker = ?", (ticker,))
+        cursor.execute("SELECT available_shares, total_shares, current_price, auto_price FROM stocks WHERE ticker = %s", (ticker,))
         avail, total, price, auto = cursor.fetchone()
-        cursor.execute("SELECT COUNT(*) FROM waitlist WHERE ticker = ?", (ticker,))
+        cursor.execute("SELECT COUNT(*) FROM waitlist WHERE ticker = %s", (ticker,))
         waitlist_count = cursor.fetchone()[0]
 
         net = bought - sold
@@ -1011,13 +1053,13 @@ async def activityreport(ctx, days: int = 7):
 
 @bot.command()
 async def viewwaitlist(ctx, ticker: str):
-    """[Admin] See the full waitlist for a stock. Usage: !viewwaitlist OBK"""
+    ensure_connection()
     if ctx.author.id not in ADMIN_IDS:
         await ctx.send("❌ Denied.")
         return
 
     ticker = ticker.upper()
-    cursor.execute("SELECT discord_id, shares, queued_at FROM waitlist WHERE ticker = ? ORDER BY queued_at ASC", (ticker,))
+    cursor.execute("SELECT discord_id, shares, queued_at FROM waitlist WHERE ticker = %s ORDER BY queued_at ASC", (ticker,))
     queue = cursor.fetchall()
 
     if not queue:
@@ -1034,13 +1076,13 @@ async def viewwaitlist(ctx, ticker: str):
 
 @bot.command()
 async def clearwaitlist(ctx, ticker: str):
-    """[Admin] Clear the waitlist for a stock. Usage: !clearwaitlist OBK"""
+    ensure_connection()
     if ctx.author.id not in ADMIN_IDS:
         await ctx.send("❌ Denied.")
         return
 
     ticker = ticker.upper()
-    cursor.execute("DELETE FROM waitlist WHERE ticker = ?", (ticker,))
+    cursor.execute("DELETE FROM waitlist WHERE ticker = %s", (ticker,))
     conn.commit()
     await ctx.send(f"🗑️ Waitlist for **{ticker}** cleared.")
 
