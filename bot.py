@@ -26,21 +26,26 @@ intents.message_content = True
 bot = commands.Bot(command_prefix="!", intents=intents, help_command=None)
 
 ADMIN_IDS = [909889735038746694]
-
 # 2. Database connection (PostgreSQL via Supabase)
-SUPABASE_URL = os.environ['SUPABASE_URL']
+def get_database_url():
+    # 1. Try reading from a secure Render Secret File first (Safest)
+    secret_file_path = "/opt/render/project/src/.env_secret"
+    if os.path.exists(secret_file_path):
+        with open(secret_file_path, "r") as f:
+            return f.read().strip()
+            
+    # 2. Fallback to environment variables if the file isn't there
+    return os.environ.get('SUPABASE_URL') or os.environ.get('DATABASE_URL')
+
+DATABASE_URL = get_database_url()
 
 def make_connection():
-    c = psycopg2.connect(SUPABASE_URL, sslmode='require', connect_timeout=10)
+    c = psycopg2.connect(DATABASE_URL, sslmode='require', connect_timeout=10)
     c.autocommit = False
     return c
 
 conn = make_connection()
 cursor = conn.cursor()
-
-def ensure_connection():
-    global conn, cursor
-    try:
         cursor.execute("SELECT 1")
     except (psycopg2.OperationalError, psycopg2.InterfaceError, psycopg2.DatabaseError):
         conn = make_connection()
