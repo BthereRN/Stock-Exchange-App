@@ -28,35 +28,49 @@ bot = commands.Bot(command_prefix="!", intents=intents, help_command=None)
 ADMIN_IDS = [909889735038746694]
 
 # 2. Database connection (PostgreSQL via Supabase)
-def get_database_url():
-    # 1. Look for Render's Secret File path
+def make_connection():
     secret_file_path = "/opt/render/project/src/.env_secret"
     
-    print(f"[DEBUG] Checking path: {secret_file_path}")
+    # Check if the secret file exists
     if os.path.exists(secret_file_path):
-        print("[DEBUG] Found .env_secret! Reading link...")
         with open(secret_file_path, "r") as f:
-            return f.read().strip()
+            uri = f.read().strip()
     else:
-        print("[DEBUG] .env_secret NOT found at standard path. Checking local folder...")
-        # Check if it's just in the immediate running folder
-        if os.path.exists(".env_secret"):
-            print("[DEBUG] Found .env_secret in local folder!")
-            with open(".env_secret", "r") as f:
-                return f.read().strip()
+        # Fallback to env variables if file is missing
+        uri = os.environ.get('SUPABASE_URL') or os.environ.get('DATABASE_URL') or ""
 
-    print("[DEBUG] No secret file found anywhere. Falling back to environment variables.")
-    return os.environ.get('SUPABASE_URL') or os.environ.get('DATABASE_URL')
+    # If the URI is somehow empty or still just a default word, raise a clear error
+    if not uri or uri == "postgres":
+        raise ValueError("Database connection string is missing or invalid.")
 
-DATABASE_URL = get_database_url()
+    # ULTIMATE FIX: Clean the string and manually split it for psycopg2
+    # This completely bypasses psycopg2's picky URI parser
+    try:
+        # Strip 'postgres://' or 'postgresql://' from the front
+        clean_uri = uri.replace("postgresql://", "").replace("postgres://", "")
+        
+        # Split credentials from the host info using the '@' symbol
+        auth, connection = clean_uri.split("@")
+        user, password = auth.split(":")
+        host_port, db_name = connection.split("/")
+        host, port = host_port.split(":")
 
-def make_connection():
-    c = psycopg2.connect(DATABASE_URL, sslmode='require', connect_timeout=10)
-    c.autocommit = False
-    return c
+        return psycopg2.connect(
+            database=db_name,
+            user=user,
+            password=password,
+            host=host,
+            port=port,
+            sslmode='require',
+            connect_timeout=10
+        )
+    except Exception as e:
+        print(f"[ERROR] Manual URI parsing failed: {e}. Attempting direct fallback...")
+        return psycopg2.connect(uri, sslmode='require', connect_timeout=10)
 
 conn = make_connection()
 cursor = conn.cursor()
+/* *\
 
 def ensure_connection():
     global conn, cursor
