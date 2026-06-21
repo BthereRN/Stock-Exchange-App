@@ -70,7 +70,6 @@ def make_connection():
 
 conn = make_connection()
 cursor = conn.cursor()
-/* *\
 
 def ensure_connection():
     global conn, cursor
