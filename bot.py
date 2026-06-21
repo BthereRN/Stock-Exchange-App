@@ -58,6 +58,9 @@ def make_connection():
 conn = make_connection()
 cursor = conn.cursor()
 
+def ensure_connection():
+    global conn, cursor
+    try:
         cursor.execute("SELECT 1")
     except (psycopg2.OperationalError, psycopg2.InterfaceError, psycopg2.DatabaseError):
         conn = make_connection()
