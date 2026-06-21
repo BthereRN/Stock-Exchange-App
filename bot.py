@@ -26,15 +26,26 @@ intents.message_content = True
 bot = commands.Bot(command_prefix="!", intents=intents, help_command=None)
 
 ADMIN_IDS = [909889735038746694]
+
 # 2. Database connection (PostgreSQL via Supabase)
 def get_database_url():
-    # 1. Try reading from a secure Render Secret File first (Safest)
+    # 1. Look for Render's Secret File path
     secret_file_path = "/opt/render/project/src/.env_secret"
+    
+    print(f"[DEBUG] Checking path: {secret_file_path}")
     if os.path.exists(secret_file_path):
+        print("[DEBUG] Found .env_secret! Reading link...")
         with open(secret_file_path, "r") as f:
             return f.read().strip()
-            
-    # 2. Fallback to environment variables if the file isn't there
+    else:
+        print("[DEBUG] .env_secret NOT found at standard path. Checking local folder...")
+        # Check if it's just in the immediate running folder
+        if os.path.exists(".env_secret"):
+            print("[DEBUG] Found .env_secret in local folder!")
+            with open(".env_secret", "r") as f:
+                return f.read().strip()
+
+    print("[DEBUG] No secret file found anywhere. Falling back to environment variables.")
     return os.environ.get('SUPABASE_URL') or os.environ.get('DATABASE_URL')
 
 DATABASE_URL = get_database_url()
@@ -46,6 +57,7 @@ def make_connection():
 
 conn = make_connection()
 cursor = conn.cursor()
+
         cursor.execute("SELECT 1")
     except (psycopg2.OperationalError, psycopg2.InterfaceError, psycopg2.DatabaseError):
         conn = make_connection()
