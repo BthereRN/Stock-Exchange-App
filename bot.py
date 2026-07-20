@@ -35,40 +35,58 @@ OWNERSHIP_CAP = 0.40
 # ── Database connection ───────────────────────────────────────────────────────
 DATABASE_URL = os.environ['DATABASE_URL']
 
-from urllib.parse import urlparse  # Add this import at the top of your function if not at the top of the file
-
 def make_connection():
     global DATABASE_URL
     
     if not DATABASE_URL:
         DATABASE_URL = os.environ.get('DATABASE_URL')
         
-    if DATABASE_URL:
-        DATABASE_URL = DATABASE_URL.strip().strip('"').strip("'")
-        # Ensure correct prefix for the parser
-        if DATABASE_URL.startswith("postgresql://"):
-            DATABASE_URL = DATABASE_URL.replace("postgresql://", "postgres://", 1)
+    if not DATABASE_URL:
+        raise ValueError("DATABASE_URL environment variable is missing or empty!")
 
-    # Forcefully break the URI into individual components
-    result = urlparse(DATABASE_URL)
-    username = result.username
-    password = result.password
-    database = result.path[1:]  # Drops the leading '/'
-    hostname = result.hostname
-    port = result.port
-
-    # Hand deliver the components so psycopg2 doesn't have to guess or parse anything
-    c = psycopg2.connect(
-        host=hostname,
-        database=database,
-        user=username,
-        password=password,
-        port=port,
-        connect_timeout=10
-    )
+    # Clean up any wrapping quotes or accidental spaces
+    url_str = DATABASE_URL.strip().strip('"').strip("'")
     
-    c.autocommit = False
-    return c
+    # Strip out the protocol prefix safely
+    if url_str.startswith("postgres://"):
+        url_str = url_str[11:]
+    elif url_str.startswith("postgresql://"):
+        url_str = url_str[13:]
+
+    try:
+        # 1. Split at the absolute LAST '@' to separate the password from the host address
+        credentials, host_part = url_str.rsplit('@', 1)
+        
+        # 2. Separate username and password at the first ':'
+        username, password = credentials.split(':', 1)
+        
+        # 3. Separate host/port from the database name at the first '/'
+        host_and_port, database = host_part.split('/', 1)
+        
+        # 4. Separate hostname and port number if a port exists
+        if ':' in host_and_port:
+            hostname, port = host_and_port.rsplit(':', 1)
+            port = int(port)
+        else:
+            hostname = host_and_port
+            port = 5432
+            
+        # Hand-deliver the individual components explicitly 
+        c = psycopg2.connect(
+            host=hostname,
+            database=database,
+            user=username,
+            password=password,
+            port=port,
+            connect_timeout=10
+        )
+        
+        c.autocommit = False  # Preserving your exact engine workflow
+        return c
+        
+    except Exception as e:
+        print(f"[ERROR] Failed custom parsing connection logic: {e}")
+        raise e
 
 conn = make_connection()
 cursor = conn.cursor()
