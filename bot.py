@@ -43,6 +43,7 @@ def make_connection():
         DATABASE_URL = DATABASE_URL.replace("postgresql://", "postgres://", 1)
         
     c = psycopg2.connect(DATABASE_URL, connect_timeout=10)
+    c.autocommit = False  # Kept intact from your original code!
     return c
 
 conn = make_connection()
