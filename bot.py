@@ -35,31 +35,38 @@ OWNERSHIP_CAP = 0.40
 # ── Database connection ───────────────────────────────────────────────────────
 DATABASE_URL = os.environ['DATABASE_URL']
 
+from urllib.parse import urlparse  # Add this import at the top of your function if not at the top of the file
+
 def make_connection():
     global DATABASE_URL
     
-    # If the global wasn't set or pulled correctly, grab it fresh
     if not DATABASE_URL:
         DATABASE_URL = os.environ.get('DATABASE_URL')
         
-    # --- DIAGNOSTIC PRINT ---
-    # This safely prints the structure to your logs without exposing your password
-    if DATABASE_URL:
-        safe_url = DATABASE_URL.split('@')[-1] if '@' in DATABASE_URL else DATABASE_URL
-        print(f"[DEBUG] Database host structure path is: ...@{safe_url}")
-    else:
-        print("[DEBUG] DATABASE_URL is completely Empty or None!")
-    # ------------------------
-
-    # FORCE CLEANUP: Strip whitespace, quotes, or accidental newlines
     if DATABASE_URL:
         DATABASE_URL = DATABASE_URL.strip().strip('"').strip("'")
-        
-        # If it somehow starts with the wrong protocol, fix it
+        # Ensure correct prefix for the parser
         if DATABASE_URL.startswith("postgresql://"):
             DATABASE_URL = DATABASE_URL.replace("postgresql://", "postgres://", 1)
 
-    c = psycopg2.connect(DATABASE_URL, connect_timeout=10)
+    # Forcefully break the URI into individual components
+    result = urlparse(DATABASE_URL)
+    username = result.username
+    password = result.password
+    database = result.path[1:]  # Drops the leading '/'
+    hostname = result.hostname
+    port = result.port
+
+    # Hand deliver the components so psycopg2 doesn't have to guess or parse anything
+    c = psycopg2.connect(
+        host=hostname,
+        database=database,
+        user=username,
+        password=password,
+        port=port,
+        connect_timeout=10
+    )
+    
     c.autocommit = False
     return c
 
