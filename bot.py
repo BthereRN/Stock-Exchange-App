@@ -36,14 +36,31 @@ OWNERSHIP_CAP = 0.40
 DATABASE_URL = os.environ['DATABASE_URL']
 
 def make_connection():
-    DATABASE_URL = os.environ.get('DATABASE_URL')
+    global DATABASE_URL
     
-    # Forcefully fix the 'postgresql' quirk in code if it creeps in
-    if DATABASE_URL and DATABASE_URL.startswith("postgresql://"):
-        DATABASE_URL = DATABASE_URL.replace("postgresql://", "postgres://", 1)
+    # If the global wasn't set or pulled correctly, grab it fresh
+    if not DATABASE_URL:
+        DATABASE_URL = os.environ.get('DATABASE_URL')
         
+    # --- DIAGNOSTIC PRINT ---
+    # This safely prints the structure to your logs without exposing your password
+    if DATABASE_URL:
+        safe_url = DATABASE_URL.split('@')[-1] if '@' in DATABASE_URL else DATABASE_URL
+        print(f"[DEBUG] Database host structure path is: ...@{safe_url}")
+    else:
+        print("[DEBUG] DATABASE_URL is completely Empty or None!")
+    # ------------------------
+
+    # FORCE CLEANUP: Strip whitespace, quotes, or accidental newlines
+    if DATABASE_URL:
+        DATABASE_URL = DATABASE_URL.strip().strip('"').strip("'")
+        
+        # If it somehow starts with the wrong protocol, fix it
+        if DATABASE_URL.startswith("postgresql://"):
+            DATABASE_URL = DATABASE_URL.replace("postgresql://", "postgres://", 1)
+
     c = psycopg2.connect(DATABASE_URL, connect_timeout=10)
-    c.autocommit = False  # Kept intact from your original code!
+    c.autocommit = False
     return c
 
 conn = make_connection()
