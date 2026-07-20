@@ -36,8 +36,13 @@ OWNERSHIP_CAP = 0.40
 DATABASE_URL = os.environ['DATABASE_URL']
 
 def make_connection():
+    DATABASE_URL = os.environ.get('DATABASE_URL')
+    
+    # Forcefully fix the 'postgresql' quirk in code if it creeps in
+    if DATABASE_URL and DATABASE_URL.startswith("postgresql://"):
+        DATABASE_URL = DATABASE_URL.replace("postgresql://", "postgres://", 1)
+        
     c = psycopg2.connect(DATABASE_URL, connect_timeout=10)
-    c.autocommit = False
     return c
 
 conn = make_connection()
