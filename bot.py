@@ -1486,14 +1486,7 @@ async def grant(ctx, member: discord.Member, ticker: str, shares: int):
         await ctx.send(f"❌ {member.mention} has no account. Use `!deposit` first.")
         return
 
-    total_held = get_total_shares_held(str(member.id), ticker)
-    max_allowed = int(total_shares * OWNERSHIP_CAP)
-    if total_held + shares > max_allowed:
-        await ctx.send(
-            f"⚠️ This grant would put {member.mention} over the {int(OWNERSHIP_CAP*100)}% cap "
-            f"({total_held:,} currently held, cap = {max_allowed:,}). Not processed."
-        )
-        return
+    # --- Anti-cornering restriction deleted right here ---
 
     p = get_shares_owned(str(member.id), ticker)
     if p > 0:
