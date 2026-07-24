@@ -2222,6 +2222,66 @@ async def chart(ctx, ticker: str, days: int = 60):
     close_price = prices[-1]
     change_pct = ((close_price - open_price) / open_price * 100) if open_price > 0 else 0
 
+@bot.command(name="removeshares")
+@commands.has_permissions(administrator=True)
+async def remove_shares(ctx, member: discord.Member, ticker: str, amount: int):
+    """
+    Admin Command: Removes a specific number of shares from a user's portfolio.
+    Usage: !removeshares @User TICKER 500
+    """
+    ticker = ticker.upper()
+    
+    if amount <= 0:
+        await ctx.send("❌ Amount must be a positive number.")
+        return
+
+    # 1. Fetch current portfolio balance for this ticker
+    # Adjust table/column names to match your DB schema (e.g., portfolios)
+    async with db_pool.acquire() as conn:
+        record = await conn.fetchrow(
+            "SELECT shares FROM portfolios WHERE discord_id = $1 AND ticker = $2",
+            str(member.id), ticker
+        )
+        
+        current_shares = record['shares'] if record else 0
+
+        # 2. Check if the user actually holds enough shares
+        if current_shares < amount:
+            await ctx.send(
+                f"⚠️ **Cannot process:** {member.mention} only owns **{current_shares:,}** shares of `{ticker}` "
+                f"(Attempted to remove {amount:,})."
+            )
+            return
+
+        new_shares = current_shares - amount
+
+        # 3. Update or Delete the portfolio entry
+        if new_shares == 0:
+            # Clean up the database row if they hold 0 shares now
+            await conn.execute(
+                "DELETE FROM portfolios WHERE discord_id = $1 AND ticker = $2",
+                str(member.id), ticker
+            )
+        else:
+            await conn.execute(
+                "UPDATE portfolios SET shares = $1 WHERE discord_id = $2 AND ticker = $3",
+                new_shares, str(member.id), ticker
+            )
+
+    # 4. Success Response & Audit Log
+    await ctx.send(
+        f"✅ **Admin Adjustment Complete:** Removed **{amount:,}** shares of `{ticker}` from {member.mention}.\n"
+        f"📊 **New Balance:** {new_shares:,} shares."
+    )
+
+@remove_shares.error
+async def remove_shares_error(ctx, error):
+    if isinstance(error, commands.MissingPermissions):
+        await ctx.send("❌ You do not have permission to run this command.")
+    elif isinstance(error, commands.BadArgument):
+        await ctx.send("❌ Invalid usage. Format: `!removeshares @User TICKER AMOUNT`")
+
+    
     # ── Chart rendering ───────────────────────────────────────────────────────
     fig, ax = plt.subplots(figsize=(10, 5))
     fig.patch.set_facecolor('#1a1a2e')
